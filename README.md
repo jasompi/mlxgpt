@@ -8,6 +8,30 @@ Following the [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) im
 $ uv sync
 ```
 
+## Train GPT-2 small model using a text corpus
+
+```bash
+$ uv run src/mlxgpt/train.py -h
+usage: train.py [-h] [-s SAVE] [-l LOAD] [-t TRAINING] [-e [EVAL]] [-g GENERATE] [-c] [-i INPUT] [-p]
+
+Train or evaluate GPT model
+
+options:
+  -h, --help            show this help message and exit
+  -s SAVE, --save SAVE  Name for saved model file (default: derived from load file or 'gpt-model')
+  -l LOAD, --load LOAD  Path to load pretrained model weights
+  -t TRAINING, --training TRAINING
+                        Number of training epochs (if not specified with -l, model is loaded but not trained)
+  -e [EVAL], --eval [EVAL]
+                        Evaluation frequency during training (default: 0 = no eval during training). Use -e alone to eval after training/loading.
+  -g GENERATE, --generate GENERATE
+                        Generate text with given start context
+  -c, --compile         Compile the training step for faster execution
+  -i INPUT, --input INPUT
+                        Input text file for training data (default: the-verdict.txt)
+  -p, --plot            Plot training and validation losses after training
+```
+
 ## Run GPT-2 model by loading the weights from OpenAI's checkpoint
 
 ```bash
@@ -28,7 +52,10 @@ options:
                         Temperature for sampling (default: 1.0, 0.0 for greedy)
   -k TOP_K, --top-k TOP_K
                         Top-k sampling parameter (default: 25, None to disable)
+```
 
+
+```bash
 $ uv run src/mlxgpt/gpt2.py -p "To be or not to be"
 Loading gpt2-small (124M) model from cache...
 Model loaded successfully from gpt2/GPT2-small.npz
