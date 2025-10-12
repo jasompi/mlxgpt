@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlxgpt"
+version = "0.1.0"
+description = "GPT2 model implemented with mlx (https://opensource.apple.com/projects/mlx/)"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "mlx>=0.29.0",
+  "mlx-data>=0.1.0",
+  "mlx-lm>=0.27.1",
+  "mlx-metal>=0.29.0",
+  "mlx-vlm>=0.3.3",
+
+  "tensorflow>=2.16.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+  "tensorflow==2.19.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "tensorflow>=2.18.0; sys_platform == 'linux'",
+  "tensorflow>=2.18.0; sys_platform == 'win32'",
+
+  "jupyterlab>=4.0",
+  "tiktoken>=0.5.1",
+  "matplotlib>=3.7.1",
+  "tqdm>=4.66.1",
+  "numpy>=1.26",
+  "pandas>=2.2.1",
+  "pip>=25.0.1",
+  "pytest>=8.3.5",
+]
