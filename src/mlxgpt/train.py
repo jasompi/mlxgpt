@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime
+import glob
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 import mlx.core as mx
@@ -7,11 +8,14 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.utils as utils
 from mlxgpt.dataloader import create_gpt_dataloader, MLXDataLoader
-from mlxgpt.model import GPTModel, GPTConfig
+from mlxgpt.model import GPTModel, GPTConfig, MODEL_CONFIGS
 from mlxgpt.gpt2 import generate_text_simple, text_to_token_ids, token_ids_to_text
 import tiktoken
 import time
+from tqdm import tqdm, trange
 from typing import Optional
+import os
+import shutil
 
 def calc_loss_batch(model: nn.Module, input_batch: mx.array, target_batch: mx.array) -> mx.array:
     logits = model(input_batch)
@@ -57,21 +61,136 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
     plt.savefig("loss-plot.pdf")
     plt.show()
 
-def train_model_simple(
+def evaluate_model(
     model: nn.Module,
     train_loader: MLXDataLoader,
     val_loader: MLXDataLoader,
+    eval_iter: int
+) -> tuple[float, float]:
+    model.eval()
+    train_loss = calc_loss_loader(model, train_loader, num_batches=eval_iter)
+    val_loss = calc_loss_loader(model, val_loader, num_batches=eval_iter)
+    model.train()
+    return train_loss, val_loss
+
+def create_dataloaders(
+    input_file: str,
+    train_ratio: float,
+    batch_size: int,
+    max_length: int,
+    stride: int,
+    stats_bar: tqdm,
+    text_output: tqdm,
+) -> tuple[MLXDataLoader, MLXDataLoader]:
+    """
+    Create training and validation dataloaders from input file.
+
+    Args:
+        input_file: Path to input file (.npy for pre-tokenized or .txt for raw text)
+        train_ratio: Ratio of data to use for training (e.g., 0.9 for 90%)
+        batch_size: Batch size for dataloaders
+        max_length: Maximum sequence length
+        stride: Stride for sliding window
+
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    # Check if input is a .npy file (pre-tokenized) or text file
+    if input_file.endswith('.npy'):
+        stats_bar.set_description_str(f"Loading pre-tokenized data from {input_file}...")
+        token_ids: mx.array = mx.load(input_file) # type: ignore
+        text_output.set_description_str(f"Loaded {len(token_ids):,} tokens")
+
+        # Split data
+        split_idx = int(train_ratio * len(token_ids))
+        train_data = token_ids[:split_idx]
+        val_data = token_ids[split_idx:]
+    else:
+        print(f"Loading text data from {input_file}...")
+        with open(input_file, "r", encoding="utf-8") as f:
+            text_data = f.read()
+
+        # Split data
+        split_idx = int(train_ratio * len(text_data))
+        train_data = text_data[:split_idx]
+        val_data = text_data[split_idx:]
+
+    # Create dataloaders
+    train_loader = create_gpt_dataloader(
+        train_data,
+        batch_size=batch_size,
+        max_length=max_length,
+        stride=stride,
+        drop_last=True,
+        shuffle=True,
+    )
+
+    val_loader = create_gpt_dataloader(
+        val_data,
+        batch_size=batch_size,
+        max_length=max_length,
+        stride=stride,
+        drop_last=False,
+        shuffle=False,
+    )
+
+    return train_loader, val_loader
+
+def generate_and_print_sample(
+    model: nn.Module,
+    tokenizer: tiktoken.Encoding,
+    start_context: str,
+    max_length: Optional[int] = None
+) -> str:
+    model.eval()
+    context_size = model.pos_emb.weight.shape[0]
+    encoded = text_to_token_ids(start_context, tokenizer)
+    token_ids = generate_text_simple(
+        model=model, idx=encoded,
+        max_new_tokens=50, context_size=context_size
+    )
+    model.train()
+    decoded_text = token_ids_to_text(token_ids, tokenizer)
+    decoded_text = decoded_text.replace("\n", " ")  # Compact print format
+
+    # Truncate to max_length if specified
+    if max_length is not None and len(decoded_text) > max_length:
+        # Reserve space for "..."
+        truncate_at = max_length - 3
+        # Find the last space before truncate_at to avoid cutting words
+        last_space = decoded_text.rfind(" ", 0, truncate_at)
+        if last_space > 0:
+            decoded_text = decoded_text[:last_space] + "..."
+        else:
+            # No space found, just hard truncate
+            decoded_text = decoded_text[:truncate_at] + "..."
+
+    return decoded_text
+
+def train_model_simple(
+    model: GPTModel,
+    data_files: list[str],
+    train_ratio: float,
+    batch_size: int,
     optimizer: optim.Optimizer,
     num_epochs: int,
     eval_freq: int,
     eval_iter: int,
     start_context: Optional[str],
     tokenizer: tiktoken.Encoding,
-    use_compile: bool = False
+    use_compile: bool = False,
+    output_dir: Optional[str] = None,
+    save_ckpt_freq: int = 100000,
+    model_size_m: float = 0.0,
+    print_sample_iter: int = 1000
 ) -> tuple[list[float], list[float], list[int]]:
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
+
+    # Create output directory if checkpoint saving is enabled
+    if output_dir and save_ckpt_freq > 0:
+        os.makedirs(output_dir, exist_ok=True)
 
     def loss_fn(model: nn.Module, x: mx.array, y: mx.array) -> mx.array:
         logits = model(x)
@@ -90,106 +209,174 @@ def train_model_simple(
     else:
         train_step = step
 
+    # Get terminal width for dynamic display sizing
+    terminal_width = shutil.get_terminal_size().columns
+
+    # Setup text output progress bar (always create)
+    text_output = tqdm(desc=start_context or "", position=4, bar_format='{desc}', ncols=terminal_width, leave=True)
+
     # Main training loop
-    print("Starting training...")
-    for epoch in range(num_epochs):
-        model.train()  # Set model to training mode
+    stats_bar = trange(num_epochs, desc="Current Stats", position=3, bar_format='{desc}', leave=False)
 
-        for input_batch, target_batch in train_loader:
-            loss = train_step(input_batch, target_batch)
+    print("\rStarting training...")
 
-            tokens_seen += input_batch.size
-            global_step += 1
+    try:
+        for epoch in trange(num_epochs, desc="Epoch", position=0, leave=False):
+            model.train()  # Set model to training mode
 
-            # Optional evaluation step
-            if eval_freq > 0:
-                if global_step % eval_freq == 0:
-                    train_loss, val_loss = evaluate_model(
-                        model, train_loader, val_loader, eval_iter)
-                    # mx.eval(train_loss, val_loss)
-                    train_losses.append(train_loss)
-                    val_losses.append(val_loss)
-                    track_tokens_seen.append(tokens_seen)
-                    print(f"Ep {epoch+1} (Step {global_step:06d}): "
-                        f"Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
-            else:
-                if global_step % 50 == 0:
-                    print(f"Ep {epoch+1} (Step {global_step:06d}): Train loss {loss:.3f}");
+            # Iterate over data files
+            for file_idx, data_file in enumerate(tqdm(data_files, desc=f"Data files", position=1, leave=False)):
+                # Create dataloaders for this data file
+                train_loader, val_loader = create_dataloaders(
+                    input_file=data_file,
+                    train_ratio=train_ratio,
+                    batch_size=batch_size,
+                    max_length=model.context_length,
+                    stride=model.context_length,
+                    stats_bar=stats_bar,
+                    text_output=text_output
+                )
 
-        # Print a sample text after each epoch if start_context is provided
-        if start_context:
-            generate_and_print_sample(
-                model, tokenizer, start_context
-            )
+                for input_batch, target_batch in tqdm(train_loader, desc=f"Train batch", position=2, leave=False):
+                    loss = train_step(input_batch, target_batch)
+
+                    tokens_seen += input_batch.size
+                    global_step += 1
+
+                    # Save checkpoint periodically
+                    if output_dir and save_ckpt_freq > 0 and global_step > 0 and global_step % save_ckpt_freq == 0:
+                        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        checkpoint_name = f"gpt_{model_size_m:.0f}M_{global_step:06d}_{timestamp}.npz"
+                        checkpoint_path = os.path.join(output_dir, checkpoint_name)
+                        stats_bar.set_description_str(f"Saving checkpoint to {checkpoint_path}...")
+                        model.save_weights(checkpoint_path)
+                        if start_context:
+                            text_output.set_description_str(f"Checkpoint saved at step {global_step}")
+
+                    # Optional evaluation step
+                    if eval_freq > 0:
+                        if global_step > 0 and global_step % eval_freq == 0:
+                            train_loss, val_loss = evaluate_model(
+                                model, train_loader, val_loader, eval_iter)
+                            # mx.eval(train_loss, val_loss)
+                            train_losses.append(train_loss)
+                            val_losses.append(val_loss)
+                            track_tokens_seen.append(tokens_seen)
+                            stats_bar.set_description_str(f"(Step {global_step:06d}): Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+
+                    if start_context and print_sample_iter > 0 and global_step > 0 and global_step % print_sample_iter == 0:
+                        text_output.set_description_str(generate_and_print_sample(model, tokenizer, start_context, max_length=terminal_width))
+
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user!")
+
+        # Save emergency checkpoint
+        if output_dir:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            interrupt_checkpoint_name = f"gpt_{model_size_m:.0f}M_interrupted_{global_step:06d}_{timestamp}.npz"
+            interrupt_checkpoint_path = os.path.join(output_dir, interrupt_checkpoint_name)
+            print(f"Saving interrupted checkpoint to {interrupt_checkpoint_path}...")
+            os.makedirs(output_dir, exist_ok=True)
+            model.save_weights(interrupt_checkpoint_path)
+            print(f"Checkpoint saved at step {global_step}")
+
+        # Print unprocessed files
+        remaining_files = data_files[file_idx + 1:]
+        if remaining_files:
+            print(f"\nData files not yet processed ({len(remaining_files)}):")
+            for f in remaining_files:
+                print(f"  - {f}")
+        else:
+            print("\nAll data files were processed in this epoch.")
+
+        print(f"Completed {epoch + 1} epoch(s) out of {num_epochs}")
+        print(f"Total steps: {global_step + 1}")
+        print(f"Total tokens seen: {tokens_seen:,}")
+
     return train_losses, val_losses, track_tokens_seen
-
-def evaluate_model(
-    model: nn.Module,
-    train_loader: MLXDataLoader,
-    val_loader: MLXDataLoader,
-    eval_iter: int
-) -> tuple[float, float]:
-    model.eval()
-    train_loss = calc_loss_loader(model, train_loader, num_batches=eval_iter)
-    val_loss = calc_loss_loader(model, val_loader, num_batches=eval_iter)
-    model.train()
-    return train_loss, val_loss
-
-def generate_and_print_sample(
-    model: nn.Module,
-    tokenizer: tiktoken.Encoding,
-    start_context: str
-) -> None:
-    model.eval()
-    context_size = model.pos_emb.weight.shape[0]
-    encoded = text_to_token_ids(start_context, tokenizer)
-    token_ids = generate_text_simple(
-        model=model, idx=encoded,
-        max_new_tokens=50, context_size=context_size
-    )
-    decoded_text = token_ids_to_text(token_ids, tokenizer)
-    print(decoded_text.replace("\n", " "))  # Compact print format
-    model.train()
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train or evaluate GPT model")
-    parser.add_argument("-s", "--save", type=str, default=None,
-                        help="Name for saved model file (default: derived from load file or 'gpt-model')")
+    parser.add_argument("-o", "--output_dir", type=str, default="model_checkpoints",
+                        help="Directory to save model checkpoints (default: model_checkpoints)")
+    parser.add_argument("--save_ckpt_freq", type=int, default=10000,
+                        help="Save checkpoint every N steps (default: 10000)")
     parser.add_argument("-l", "--load", type=str, default=None,
                         help="Path to load pretrained model weights")
     parser.add_argument("-t", "--training", type=int, default=None,
                         help="Number of training epochs (if not specified with -l, model is loaded but not trained)")
-    parser.add_argument("-e", "--eval", type=int, nargs='?', const=0, default=None,
-                        help="Evaluation frequency during training (default: 0 = no eval during training). Use -e alone to eval after training/loading.")
+    parser.add_argument("-e", "--eval_freq", type=int, default=100,
+                        help="Evaluation frequency during training in steps (default: 100). Set to 0 to disable evaluation during training.")
     parser.add_argument("-g", "--generate", type=str, default=None,
                         help="Generate text with given start context")
+    parser.add_argument("--print_sample_iter", type=int, default=10000,
+                        help="Generate and print sample text every N iterations (default: 1000)")
     parser.add_argument("-c", "--compile", action="store_true",
                         help="Compile the training step for faster execution")
-    parser.add_argument("-i", "--input", type=str, default="the-verdict.txt",
-                        help="Input text file for training data (default: the-verdict.txt)")
+    parser.add_argument("-i", "--input", type=str, nargs='+', default=["the-verdict.txt"],
+                        help="Input data file(s) for training. Accepts single file, multiple files, or wildcards (e.g., '*.npy' or 'data/*.txt')")
     parser.add_argument("-p", "--plot", action="store_true",
                         help="Plot training and validation losses after training")
+    parser.add_argument("--lr", "--learning_rate", type=float, default=5e-4,
+                        help="Learning rate for the optimizer (default: 5e-4)")
+    parser.add_argument("-b", "--batch_size", type=int, default=4,
+                        help="Batch size for training (default: 4)")
+    parser.add_argument("-s", "--size", type=str, default=None,
+                        help="Model size: 'small' (124M), 'medium' (355M), 'large' (774M), 'xl' (1558M). If not specified, uses debug config.")
 
     args = parser.parse_args()
 
+    # Resolve wildcards and collect all input files
+    data_files = []
+    for pattern in args.input:
+        # Expand wildcards
+        matched_files = glob.glob(pattern)
+        if matched_files:
+            data_files.extend(matched_files)
+        else:
+            # If no match, treat as literal filename (could be error or single file)
+            data_files.append(pattern)
+
+    # Remove duplicates and sort
+    data_files = sorted(set(data_files))
+
+    if not data_files:
+        print("Error: No input files found.")
+        return
+
+    print(f"Found {len(data_files)} data file(s):")
+
     # --- Hyperparameters ---
-    batch_size = 4
+    batch_size = args.batch_size
 
     # --- Model & Tokenizer Setup ---
     tokenizer = tiktoken.get_encoding("gpt2")
     vocab_size = tokenizer.n_vocab # 50257 for GPT-2 tokenizer
 
-    GPT_CONFIG_124M = {
-        "vocab_size": vocab_size,   # Vocabulary size
-        "context_length": 256,      # Shortened context length (orig: 1024)
-        "emb_dim": 768,             # Embedding dimension
-        "n_heads": 12,              # Number of attention heads
-        "n_layers": 12,             # Number of layers
-        "drop_rate": 0.1,           # Dropout rate
-        "qkv_bias": False           # Query-key-value bias
-    }
+    # Select model configuration based on size parameter
+    if args.size and args.size in MODEL_CONFIGS:
+        # Use predefined model config and override drop_rate and qkv_bias
+        config = MODEL_CONFIGS[args.size]
+        config.drop_rate = 0.0
+        config.qkv_bias = False
+        print(f"Using '{args.size}' model configuration")
+    else:
+        # Use debug configuration
+        if args.size:
+            print(f"Warning: Size '{args.size}' not found in MODEL_CONFIGS. Using debug config.")
+        GPT_CONFIG_DEBUG = {
+            "vocab_size": vocab_size,
+            "context_length": 128,
+            "emb_dim": 768,
+            "n_heads": 12,
+            "n_layers": 12,
+            "drop_rate": 0.0,
+            "qkv_bias": False
+        }
+        config = GPTConfig.from_dict(GPT_CONFIG_DEBUG)
+        print("Using debug model configuration")
 
-    model = GPTModel(GPTConfig.from_dict(GPT_CONFIG_124M))
+    model = GPTModel(config)
 
     # Load pretrained weights if specified
     if args.load:
@@ -200,56 +387,40 @@ def main() -> None:
     mx.eval(model.parameters()) # Materialize model parameters
 
     num_params = sum(p.size for _, p in utils.tree_flatten(model.parameters()))
-    print(f"Model initialized with {num_params:,} parameters.")
+    model_size_m = num_params / 1_000_000  # Convert to millions
+    print(f"Model initialized with {num_params:,} parameters ({model_size_m:.1f}M).")
 
     # --- Data Loading ---
-    with open(args.input, "r", encoding="utf-8") as f:
-        text_data = f.read()
-
-    # Train/validation ratio
-    train_ratio = 0.90
-    split_idx = int(train_ratio * len(text_data))
-    train_data = text_data[:split_idx]
-    val_data = text_data[split_idx:]
-
-    train_loader = create_gpt_dataloader(
-        train_data,
-        batch_size=batch_size,
-        max_length=GPT_CONFIG_124M["context_length"],
-        stride=GPT_CONFIG_124M["context_length"],
-        drop_last=True,
-        shuffle=True,
-    )
-
-    val_loader = create_gpt_dataloader(
-        val_data,
-        batch_size=batch_size,
-        max_length=GPT_CONFIG_124M["context_length"],
-        stride=GPT_CONFIG_124M["context_length"],
-        drop_last=False,
-        shuffle=False,
-    )
+    # Determine train ratio based on file type
+    train_ratio = 0.95
 
     if args.training:
         # Training mode
-        optimizer = optim.AdamW(learning_rate=0.0001, weight_decay=0.01)
+        optimizer = optim.AdamW(learning_rate=args.lr, weight_decay=0.01)
 
         # Default to 20 epochs if not specified
         num_epochs = args.training if args.training is not None else 20
         start_time = time.time()
 
-        # Determine evaluation:
-        # if -e not specified no evalutation,
-        # if -e specified without value, no eval during training, only at end
-        # if -e specified with value, use that value for eval during training
-        # and also eval at the end
-        eval_freq = 0 if args.eval is None else args.eval
+        # Use the eval_freq from command line arguments
+        eval_freq = args.eval_freq
 
         train_losses, val_losses, tokens_seen = train_model_simple(
-            model, train_loader, val_loader, optimizer,
-            num_epochs=num_epochs, eval_freq=eval_freq, eval_iter=5,
-            start_context=args.generate, tokenizer=tokenizer,
-            use_compile=args.compile
+            model=model,
+            data_files=data_files,  # Pass resolved list of files
+            train_ratio=train_ratio,
+            batch_size=batch_size,
+            optimizer=optimizer,
+            num_epochs=num_epochs,
+            eval_freq=eval_freq,
+            eval_iter=5,
+            start_context=args.generate,
+            tokenizer=tokenizer,
+            use_compile=args.compile,
+            output_dir=args.output_dir,
+            save_ckpt_freq=args.save_ckpt_freq,
+            model_size_m=model_size_m,
+            print_sample_iter=args.print_sample_iter
         )
 
         end_time = time.time()
@@ -262,31 +433,14 @@ def main() -> None:
             examples_seen_tensor = mx.linspace(0, tokens_seen[-1], len(train_losses))
             plot_losses(epochs_tensor, examples_seen_tensor, train_losses, val_losses)
 
-        # Determine save filename
-        if args.save:
-            base_name = args.save
-        elif args.load:
-            # Derive from load filename: remove extension and timestamp if present
-            import os
-            base_name = os.path.splitext(os.path.basename(args.load))[0]
-            # Remove timestamp pattern (e.g., -20240101-123456)
-            import re
-            base_name = re.sub(r'-\d{8}-\d{6}$', '', base_name)
-        else:
-            base_name = "gpt-model"
-
-        # Save model weights
+        # Save final model weights
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        save_path = f"{base_name}-{timestamp}.npz"
-        print(f"Saving model weights to {save_path}...")
-        model.save_weights(save_path)
-        print(f"Model weights saved to {save_path}")
-
-    # If -e was specified, perform eval after training
-    if args.eval is not None:
-        print("Running final evaluation...")
-        train_loss, val_loss = evaluate_model(model, train_loader, val_loader, eval_iter=10)
-        print(f"Train loss: {train_loss:.3f}, Val loss: {val_loss:.3f}")
+        final_checkpoint_name = f"gpt_{model_size_m:.0f}M_final_{timestamp}.npz"
+        final_checkpoint_path = os.path.join(args.output_dir, final_checkpoint_name)
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Saving final model weights to {final_checkpoint_path}...")
+        model.save_weights(final_checkpoint_path)
+        print(f"Final model weights saved to {final_checkpoint_path}")
 
     # If -g was specified, generate text after training
     if args.generate and not args.training:

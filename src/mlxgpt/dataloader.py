@@ -33,17 +33,19 @@ class MLXDataLoader:
 tokenizer = tiktoken.get_encoding("gpt2")
 
 
-def create_gpt_dataloader(txt: str, batch_size: int = 4, max_length: int = 256,
+def create_gpt_dataloader(txt: str|mx.array, batch_size: int = 4, max_length: int = 256,
                           stride: int = 128, shuffle: bool = True, drop_last: bool = True) -> MLXDataLoader:
     """
     Creates an MLX data loader for a GPT-style language model.
 
-    This function processes a text, tokenizes it, and then uses a
-    sliding window to create input and target sequences. It then uses
+    This function processes text input (either raw text or pre-tokenized tokens),
+    and then uses a sliding window to create input and target sequences. It then uses
     the MLX data library to create an efficient data stream for training.
 
     Args:
-        txt (str): The input text to be processed.
+        txt (str|mx.array): The input text to be processed. Can be either:
+            - str: Raw text that will be tokenized using GPT-2 tokenizer
+            - mx.array: Pre-tokenized token IDs as an MLX array
         batch_size (int): The number of samples per batch.
         max_length (int): The maximum length of the input and target sequences.
         stride (int): The stride (step size) for the sliding window.
@@ -54,8 +56,8 @@ def create_gpt_dataloader(txt: str, batch_size: int = 4, max_length: int = 256,
         MLXDataLoader: A data loader that yields batches of (input_ids, target_ids) as MLX arrays.
     """
 
-    # Tokenize the entire text
-    token_ids = mx.array(tokenizer.encode(txt, allowed_special={"<|endoftext|>"}))
+    # Tokenize the entire text if it's a string, otherwise use pre-tokenized array
+    token_ids = mx.array(tokenizer.encode(txt, allowed_special={"<|endoftext|>"})) if isinstance(txt, str) else txt
     if len(token_ids) < max_length + 1:
         raise ValueError("Number of tokenized inputs must at least be equal to max_length + 1")
 
@@ -239,7 +241,8 @@ if __name__ == "__main__":
     # Simple example text
     example_text = "Hello, my name is GPT. I am a language model. I can write and answer questions. The quick brown fox jumps over the lazy dog."
 
-    # Create the MLX data loader
+    # Test 1: Create dataloader with string input
+    print("\n=== Test 1: String input ===")
     gpt_dataloader = create_gpt_dataloader(
         txt=example_text,
         batch_size=3,
@@ -270,4 +273,34 @@ if __name__ == "__main__":
         print("Decoded Input:", "\n".join([repr(line) for line in input_text]))
         print("Decoded Target:", "\n".join([repr(line) for line in target_text]))
 
-    print("✅ create_gpt_dataloader test passed.")
+    print("✅ String input test passed.")
+
+    # Test 2: Create dataloader with pre-tokenized mx.array input
+    print("\n=== Test 2: Pre-tokenized mx.array input ===")
+    pre_tokenized = mx.array(tokenizer.encode(example_text, allowed_special={"<|endoftext|>"}))
+    print(f"Pre-tokenized array shape: {pre_tokenized.shape}")
+
+    gpt_dataloader_pretokenized = create_gpt_dataloader(
+        txt=pre_tokenized,
+        batch_size=3,
+        max_length=4,
+        stride=4,
+        shuffle=False,
+    )
+
+    print(f"type of gpt_dataloader: {type(gpt_dataloader_pretokenized)}")
+    print(f"len of gpt_dataloader: {len(gpt_dataloader_pretokenized)}")
+
+    print("Iterating through the GPT data loader with pre-tokenized input:")
+    for i, (input_ids, target_ids) in enumerate(gpt_dataloader_pretokenized):
+        print(f"\nBatch {i+1}:")
+        print("Input IDs shape:", input_ids.shape)
+        print("Target IDs shape:", target_ids.shape)
+        assert isinstance(input_ids, mx.array), f"Input IDs is {type(input_ids)}, expected mx.array"
+        assert isinstance(target_ids, mx.array), f"Target IDs is {type(target_ids)}, expected mx.array"
+        assert len(input_ids.shape) == 2, f"Input IDs has {len(input_ids.shape)} dimensions, expected 2"
+        assert len(target_ids.shape) == 2, f"Target IDs has {len(target_ids.shape)} dimensions, expected 2"
+        assert input_ids.shape == target_ids.shape, f"Shape mismatch: input {input_ids.shape} vs target {target_ids.shape}"
+
+    print("✅ Pre-tokenized mx.array input test passed.")
+    print("✅ All create_gpt_dataloader tests passed.")

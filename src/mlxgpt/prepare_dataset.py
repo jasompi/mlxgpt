@@ -23,7 +23,8 @@ def is_english(text: str, threshold: float = 0.9) -> bool:
 
 
 def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500, separator="<|endoftext|>",
-                  fallback_encoding: str = "latin1", tokenizer: Optional[tiktoken.Encoding] = None):
+                  fallback_encoding: str = "latin1", tokenizer: Optional[tiktoken.Encoding] = None,
+                  dtype: str = "int32", max_files: Optional[int] = None):
     """
     Combine multiple text files into larger files, optionally tokenizing them.
 
@@ -33,7 +34,9 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
         max_size_mb: Maximum size in MB for each combined file
         separator: Token to separate documents (default: "<|endoftext|>")
         fallback_encoding: Encoding to use if UTF-8 fails (default: "latin1")
-        tokenizer: Optional tokenizer for creating .npz token files
+        tokenizer: Optional tokenizer for creating .npy token files
+        dtype: Data type for saved token arrays (default: "int32")
+        max_files: Maximum number of output files to create (default: None, process all)
 
     Returns:
         Number of combined files created
@@ -81,7 +84,11 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
             token_ids = tokenizer.encode(content)
 
         # Check if adding this document exceeds the size limit
-        if (current_size + estimated_size > max_size_mb * 1024 * 1024):
+        if current_size + estimated_size > max_size_mb * 1024 * 1024:
+            # Check if we've reached the maximum number of files before saving
+            if max_files is not None and file_counter > max_files:
+                break
+
             # Save accumulated content to file
             target_file_path = os.path.join(target_dir, f"combined_{file_counter}.txt")
             with open(target_file_path, "w", encoding="utf-8") as target_file:
@@ -93,8 +100,8 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
 
             # Save tokenized version if tokenizer is provided
             if tokenizer is not None:
-                target_token_file_path = os.path.join(target_dir, f"combined_{file_counter}_tokens.npz")
-                np.savez(target_token_file_path, np.array(current_token_ids))
+                target_token_file_path = os.path.join(target_dir, f"combined_{file_counter}_tokens.npy")
+                np.save(target_token_file_path, np.array(current_token_ids, dtype=dtype))
                 # Start new token accumulation with current document + EOT token
                 current_token_ids = token_ids + [tokenizer.eot_token]
 
@@ -110,22 +117,25 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
                 current_token_ids.append(tokenizer.eot_token)  # Add end-of-text token
                 
 
-    # Save any remaining content
-    if current_content:
+    # Save any remaining content (if we haven't reached the limit)
+    num_files_saved = file_counter - 1
+    if current_content and (max_files is None or file_counter <= max_files):
         target_file_path = os.path.join(target_dir, f"combined_{file_counter}.txt")
         with open(target_file_path, "w", encoding="utf-8") as target_file:
             target_file.write(separator.join(current_content) + separator)
 
         # Save remaining tokens if tokenizer is provided
         if tokenizer is not None:
-            target_token_file_path = os.path.join(target_dir, f"combined_{file_counter}_tokens.npz")
-            np.savez(target_token_file_path, np.array(current_token_ids))
+            target_token_file_path = os.path.join(target_dir, f"combined_{file_counter}_tokens.npy")
+            np.save(target_token_file_path, np.array(current_token_ids, dtype=dtype))
 
-    return file_counter
+        num_files_saved = file_counter
+
+    return num_files_saved
 
 
 def verify_tokenization(output_dir: str) -> bool:
-    """Verify that .npz token files match the tokenization of .txt files."""
+    """Verify that .npy token files match the tokenization of .txt files."""
     tokenizer = tiktoken.get_encoding("gpt2")
     txt_files = sorted([f for f in os.listdir(output_dir) if f.startswith("combined_") and f.endswith(".txt")])
 
@@ -142,9 +152,9 @@ def verify_tokenization(output_dir: str) -> bool:
         file_num = match.group(1)
 
         txt_path = os.path.join(output_dir, txt_file)
-        npz_path = os.path.join(output_dir, f"combined_{file_num}_tokens.npz")
+        npy_path = os.path.join(output_dir, f"combined_{file_num}_tokens.npy")
 
-        if not os.path.exists(npz_path):
+        if not os.path.exists(npy_path):
             print(f"❌ {txt_file}: Missing corresponding tokens file")
             all_verified = False
             continue
@@ -157,8 +167,7 @@ def verify_tokenization(output_dir: str) -> bool:
         expected_tokens = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
 
         # Load saved tokens
-        loaded_data = np.load(npz_path)
-        saved_tokens = loaded_data['arr_0'].tolist()
+        saved_tokens = np.load(npy_path).tolist()
 
         # Compare
         if expected_tokens == saved_tokens:
@@ -183,6 +192,10 @@ if __name__ == "__main__":
                         help="Directory where the preprocessed data will be saved")
     parser.add_argument("-t", "--tokenize", action="store_true",
                         help="Whether to tokenize the data after preprocessing")
+    parser.add_argument("--type", dest="dtype", type=str, default="int32",
+                        help="Data type for saved token arrays (e.g., int32, uint16, int64). Default: int32")
+    parser.add_argument("-n", "--num_of_dataset", type=int, default=None,
+                        help="Maximum number of output dataset files to create (default: None, process all)")
     parser.add_argument("-v", "--verify", action="store_true",
                         help="Verify that token files match the text files in output_dir")
 
@@ -202,5 +215,10 @@ if __name__ == "__main__":
         tokenizer = tiktoken.get_encoding("gpt2") if args.tokenize else None
 
         print(f"Processing {len(all_files)} file(s)...")
-        file_counter = combine_files(all_files, args.output_dir, max_size_mb=args.max_size_mb, tokenizer=tokenizer)
+        if args.tokenize:
+            print(f"Token dtype: {args.dtype}")
+        if args.num_of_dataset:
+            print(f"Maximum output files: {args.num_of_dataset}")
+        file_counter = combine_files(all_files, args.output_dir, max_size_mb=args.max_size_mb,
+                                     tokenizer=tokenizer, dtype=args.dtype, max_files=args.num_of_dataset)
         print(f"{file_counter} file(s) saved in {os.path.abspath(args.output_dir)}")
