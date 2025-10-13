@@ -156,7 +156,7 @@ def create_gpt_model(size: str) -> 'GPTModel':
         gpt.load_weights(str(weights_path))
         print(f"Model loaded successfully from {weights_path}")
     else:
-        from gpt_download import download_and_load_gpt2
+        from mlxgpt.gpt_download import download_and_load_gpt2
         print(f"Downloading gpt2-{size} ({model_size}) model...")
         _, params = download_and_load_gpt2(model_size=model_size, models_dir="gpt2")
         _load_weights_into_gpt(gpt, params)

@@ -12,8 +12,10 @@ from mlxgpt.model import GPTModel, GPTConfig, MODEL_CONFIGS
 from mlxgpt.gpt2 import generate_text_simple, text_to_token_ids, token_ids_to_text
 import tiktoken
 import time
-from tqdm import tqdm, trange
-from typing import Optional
+from tqdm.auto import tqdm, trange
+from typing import Optional, Callable
+from functools import partial
+import sys
 import os
 import shutil
 
@@ -73,14 +75,53 @@ def evaluate_model(
     model.train()
     return train_loss, val_loss
 
-def create_dataloaders(
+def is_notebook() -> bool:
+    """Check if code is running in a Jupyter notebook."""
+    try:
+        shell = get_ipython().__class__.__name__  # type: ignore
+        if shell == 'ZMQInteractiveShell':
+            return True   # Jupyter notebook or qtconsole
+        elif shell == 'TerminalInteractiveShell':
+            return False  # Terminal running IPython
+        else:
+            return False  # Other type (?)
+    except NameError:
+        return False      # Probably standard Python interpreter
+
+def truncate_text(text: str, max_length: Optional[int] = None) -> str:
+    """
+    Truncate text to max_length, replacing newlines with spaces.
+
+    Args:
+        text: The text to truncate
+        max_length: Maximum length of the output text. If None, no truncation is applied.
+
+    Returns:
+        Truncated text with "..." suffix if truncated
+    """
+    # Replace newlines with spaces
+    output_text = text.strip().replace("\n", " ")
+
+    # Truncate to max_length if specified
+    if max_length is not None and len(output_text) > max_length:
+        # Reserve space for "..."
+        truncate_at = max_length - 3
+        # Find the last space before truncate_at to avoid cutting words
+        last_space = output_text.rfind(" ", 0, truncate_at)
+        if last_space > 0:
+            output_text = output_text[:last_space] + "..."
+        else:
+            # No space found, just hard truncate
+            output_text = output_text[:truncate_at] + "..."
+
+    return output_text
+        
+def create_gpt_dataloaders(
     input_file: str,
     train_ratio: float,
     batch_size: int,
     max_length: int,
     stride: int,
-    stats_bar: tqdm,
-    text_output: tqdm,
 ) -> tuple[MLXDataLoader, MLXDataLoader]:
     """
     Create training and validation dataloaders from input file.
@@ -97,16 +138,13 @@ def create_dataloaders(
     """
     # Check if input is a .npy file (pre-tokenized) or text file
     if input_file.endswith('.npy'):
-        stats_bar.set_description_str(f"Loading pre-tokenized data from {input_file}...")
         token_ids: mx.array = mx.load(input_file) # type: ignore
-        text_output.set_description_str(f"Loaded {len(token_ids):,} tokens")
 
         # Split data
         split_idx = int(train_ratio * len(token_ids))
         train_data = token_ids[:split_idx]
         val_data = token_ids[split_idx:]
     else:
-        print(f"Loading text data from {input_file}...")
         with open(input_file, "r", encoding="utf-8") as f:
             text_data = f.read()
 
@@ -136,11 +174,10 @@ def create_dataloaders(
 
     return train_loader, val_loader
 
-def generate_and_print_sample(
+def generate_sample(
     model: nn.Module,
     tokenizer: tiktoken.Encoding,
-    start_context: str,
-    max_length: Optional[int] = None
+    start_context: str
 ) -> str:
     model.eval()
     context_size = model.pos_emb.weight.shape[0]
@@ -151,42 +188,29 @@ def generate_and_print_sample(
     )
     model.train()
     decoded_text = token_ids_to_text(token_ids, tokenizer)
-    decoded_text = decoded_text.replace("\n", " ")  # Compact print format
-
-    # Truncate to max_length if specified
-    if max_length is not None and len(decoded_text) > max_length:
-        # Reserve space for "..."
-        truncate_at = max_length - 3
-        # Find the last space before truncate_at to avoid cutting words
-        last_space = decoded_text.rfind(" ", 0, truncate_at)
-        if last_space > 0:
-            decoded_text = decoded_text[:last_space] + "..."
-        else:
-            # No space found, just hard truncate
-            decoded_text = decoded_text[:truncate_at] + "..."
-
     return decoded_text
 
 def train_model_simple(
     model: GPTModel,
     data_files: list[str],
-    train_ratio: float,
-    batch_size: int,
+    create_dataloaders_fn: Callable[[str], tuple[MLXDataLoader, MLXDataLoader]],
     optimizer: optim.Optimizer,
     num_epochs: int,
     eval_freq: int,
     eval_iter: int,
-    start_context: Optional[str],
     tokenizer: tiktoken.Encoding,
     use_compile: bool = False,
     output_dir: Optional[str] = None,
     save_ckpt_freq: int = 100000,
     model_size_m: float = 0.0,
+    start_context: Optional[str] = None,
     print_sample_iter: int = 1000
 ) -> tuple[list[float], list[float], list[int]]:
     # Initialize lists to track losses and tokens seen
     train_losses, val_losses, track_tokens_seen = [], [], []
     tokens_seen, global_step = 0, -1
+    
+    total_iter = num_epochs * len(data_files)
 
     # Create output directory if checkpoint saving is enabled
     if output_dir and save_ckpt_freq > 0:
@@ -209,49 +233,46 @@ def train_model_simple(
     else:
         train_step = step
 
-    # Get terminal width for dynamic display sizing
-    terminal_width = shutil.get_terminal_size().columns
-
-    # Setup text output progress bar (always create)
-    text_output = tqdm(desc=start_context or "", position=4, bar_format='{desc}', ncols=terminal_width, leave=True)
-
-    # Main training loop
-    stats_bar = trange(num_epochs, desc="Current Stats", position=3, bar_format='{desc}', leave=False)
-
-    print("\rStarting training...")
-
+    stats_bar = tqdm(total=0, desc=f"(Step {global_step + 1:09d}): Train loss ---, Val loss ---",
+                                         position=0, leave=False)
+    if is_notebook():
+        output_fn = print  # Use standard print function in notebooks
+    else:
+        # Get terminal width for dynamic display sizing
+        terminal_width = shutil.get_terminal_size().columns
+        # Setup text output progress bar (always create)
+        text_output = tqdm(desc=start_context or "", position=4, bar_format='{desc}', ncols=terminal_width, leave=True)
+        # Redirect stdout to text_output only if not in a notebook
+        output_fn = lambda text: text_output.set_description_str(truncate_text(text, max_length=terminal_width))
+        
     try:
-        for epoch in trange(num_epochs, desc="Epoch", position=0, leave=False):
+        # Main training loop
+        for epoch in trange(num_epochs, desc="Epoch", position=1, leave=False):
             model.train()  # Set model to training mode
 
             # Iterate over data files
-            for file_idx, data_file in enumerate(tqdm(data_files, desc=f"Data files", position=1, leave=False)):
+            for file_idx, data_file in enumerate(tqdm(data_files, desc="Data files", position=2, leave=False)) if len(data_files) > 1 else enumerate(data_files):
                 # Create dataloaders for this data file
-                train_loader, val_loader = create_dataloaders(
-                    input_file=data_file,
-                    train_ratio=train_ratio,
-                    batch_size=batch_size,
-                    max_length=model.context_length,
-                    stride=model.context_length,
-                    stats_bar=stats_bar,
-                    text_output=text_output
-                )
+                train_loader, val_loader = create_dataloaders_fn(data_file)
 
-                for input_batch, target_batch in tqdm(train_loader, desc=f"Train batch", position=2, leave=False):
+                stats_bar.total = global_step + len(train_loader) * total_iter
+                stats_bar.refresh()
+                total_iter -= 1
+                for input_batch, target_batch in tqdm(train_loader, desc=f"Train batch", position=3, leave=False):
                     loss = train_step(input_batch, target_batch)
 
                     tokens_seen += input_batch.size
                     global_step += 1
-
+                    stats_bar.update(1)
+    
                     # Save checkpoint periodically
                     if output_dir and save_ckpt_freq > 0 and global_step > 0 and global_step % save_ckpt_freq == 0:
                         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                         checkpoint_name = f"gpt_{model_size_m:.0f}M_{global_step:06d}_{timestamp}.npz"
                         checkpoint_path = os.path.join(output_dir, checkpoint_name)
-                        stats_bar.set_description_str(f"Saving checkpoint to {checkpoint_path}...")
+                        output_fn(f"Saving checkpoint to {checkpoint_path}...")
                         model.save_weights(checkpoint_path)
-                        if start_context:
-                            text_output.set_description_str(f"Checkpoint saved at step {global_step}")
+                        output_fn(f"Checkpoint saved at step {global_step}")
 
                     # Optional evaluation step
                     if eval_freq > 0:
@@ -262,10 +283,11 @@ def train_model_simple(
                             train_losses.append(train_loss)
                             val_losses.append(val_loss)
                             track_tokens_seen.append(tokens_seen)
-                            stats_bar.set_description_str(f"(Step {global_step:06d}): Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
+                            stats_bar.set_description_str(f"(Step {global_step:09d}): Train loss {train_loss:.3f}, Val loss {val_loss:.3f}")
 
                     if start_context and print_sample_iter > 0 and global_step > 0 and global_step % print_sample_iter == 0:
-                        text_output.set_description_str(generate_and_print_sample(model, tokenizer, start_context, max_length=terminal_width))
+                        sample_text = generate_sample(model, tokenizer, start_context)
+                        output_fn(sample_text)
 
     except KeyboardInterrupt:
         print("\n\nTraining interrupted by user!")
@@ -405,21 +427,29 @@ def main() -> None:
         # Use the eval_freq from command line arguments
         eval_freq = args.eval_freq
 
+        # Create partial function for dataloaders
+        create_dataloaders_fn = partial(
+            create_gpt_dataloaders,
+            train_ratio=train_ratio,
+            batch_size=batch_size,
+            max_length=model.context_length,
+            stride=model.context_length
+        )
+
         train_losses, val_losses, tokens_seen = train_model_simple(
             model=model,
             data_files=data_files,  # Pass resolved list of files
-            train_ratio=train_ratio,
-            batch_size=batch_size,
+            create_dataloaders_fn=create_dataloaders_fn,
             optimizer=optimizer,
             num_epochs=num_epochs,
             eval_freq=eval_freq,
             eval_iter=5,
-            start_context=args.generate,
             tokenizer=tokenizer,
             use_compile=args.compile,
             output_dir=args.output_dir,
             save_ckpt_freq=args.save_ckpt_freq,
             model_size_m=model_size_m,
+            start_context=args.generate,
             print_sample_iter=args.print_sample_iter
         )
 
@@ -445,7 +475,8 @@ def main() -> None:
     # If -g was specified, generate text after training
     if args.generate and not args.training:
         print(f"\nGenerating text with start context: '{args.generate}'")
-        generate_and_print_sample(model, tokenizer, args.generate)
+        generated_text = generate_sample(model, tokenizer, args.generate)
+        print(generated_text)
 
 
 if __name__ == "__main__":
