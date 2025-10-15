@@ -1,4 +1,4 @@
-# Implement the GPT2 model using MLS
+# Implement the GPT2 model using MLX framework
 
 Following the [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) implemented the GPT-2 model from scratch using Apple's [MLX](https://opensource.apple.com/projects/mlx/) framework that run faster on Apple Silicon.
 
@@ -8,28 +8,79 @@ Following the [LLMs-from-scratch](https://github.com/rasbt/LLMs-from-scratch) im
 $ uv sync
 ```
 
-## Train GPT-2 small model using a text corpus
+## Pretraining GPT-2 Model Using a Text Corpus
+
+The train.py can be used to train a GPT2 architecture model using a text corpus from scratch.
+The text corpus can be a set of txt files or pre-tokenized text files in npy format. 
+
 
 ```bash
 $ uv run src/mlxgpt/train.py -h
-usage: train.py [-h] [-s SAVE] [-l LOAD] [-t TRAINING] [-e [EVAL]] [-g GENERATE] [-c] [-i INPUT] [-p]
+usage: train.py [-h] [-o OUTPUT_DIR] [--save_ckpt_freq SAVE_CKPT_FREQ] [-l LOAD] [-t TRAINING] [-e EVAL_FREQ] [-g GENERATE] [--print_sample_iter PRINT_SAMPLE_ITER]
+                [-c] [-i INPUT [INPUT ...]] [-p] [--lr LR] [-b BATCH_SIZE] [-s SIZE]
 
 Train or evaluate GPT model
 
 options:
   -h, --help            show this help message and exit
-  -s SAVE, --save SAVE  Name for saved model file (default: derived from load file or 'gpt-model')
+  -o OUTPUT_DIR, --output_dir OUTPUT_DIR
+                        Directory to save model checkpoints (default: model_checkpoints)
+  --save_ckpt_freq SAVE_CKPT_FREQ
+                        Save checkpoint every N steps (default: 10000)
   -l LOAD, --load LOAD  Path to load pretrained model weights
   -t TRAINING, --training TRAINING
                         Number of training epochs (if not specified with -l, model is loaded but not trained)
-  -e [EVAL], --eval [EVAL]
-                        Evaluation frequency during training (default: 0 = no eval during training). Use -e alone to eval after training/loading.
+  -e EVAL_FREQ, --eval_freq EVAL_FREQ
+                        Evaluation frequency during training in steps (default: 100). Set to 0 to disable evaluation during training.
   -g GENERATE, --generate GENERATE
                         Generate text with given start context
+  --print_sample_iter PRINT_SAMPLE_ITER
+                        Generate and print sample text every N iterations (default: 10000)
   -c, --compile         Compile the training step for faster execution
-  -i INPUT, --input INPUT
-                        Input text file for training data (default: the-verdict.txt)
+  -i INPUT [INPUT ...], --input INPUT [INPUT ...]
+                        Input data file(s) for training. Accepts single file, multiple files, or wildcards (e.g., '*.npy' or 'data/*.txt')
   -p, --plot            Plot training and validation losses after training
+  --lr LR, --learning_rate LR
+                        Learning rate for the optimizer (default: 5e-4)
+  -b BATCH_SIZE, --batch_size BATCH_SIZE
+                        Batch size for training (default: 4)
+  -s SIZE, --size SIZE  Model size: 'small' (124M), 'medium' (355M), 'large' (774M), 'xl' (1558M). If not specified, uses debug config.
+```
+
+### Pretraining GPT using Project Gutenberg Dataset
+
+You can using the free books provided by Project Gutenberg as text corpus. To download the books clone [pgcorpus/gutenberg](https://github.com/pgcorpus/gutenberg) and folloing instructions in [README](https://github.com/pgcorpus/gutenberg/blob/master/README.md) to download and processing the data. Then use the prepare_dataset.py to combine the books and pre-tokenize the text.
+
+```bash
+$ uv run src/mlxgpt/prepare_dataset.py -h
+usage: prepare_dataset.py [-h] [-d DATA_DIR] [-m MAX_SIZE_MB] [-o OUTPUT_DIR] [-t] [--type DTYPE] [-n NUM_OF_DATASET] [-v]
+
+Preprocess and combine text files for pretraining
+
+options:
+  -h, --help            show this help message and exit
+  -d DATA_DIR, --data_dir DATA_DIR
+                        Directory containing the downloaded raw training data
+  -m MAX_SIZE_MB, --max_size_mb MAX_SIZE_MB
+                        The maximum file size for each concatenated file in megabytes
+  -o OUTPUT_DIR, --output_dir OUTPUT_DIR
+                        Directory where the preprocessed data will be saved
+  -t, --tokenize        Whether to tokenize the data after preprocessing
+  --type DTYPE          Data type for saved token arrays (e.g., int32, uint16, int64). Default: int32
+  -n NUM_OF_DATASET, --num_of_dataset NUM_OF_DATASET
+                        Maximum number of output dataset files to create (default: None, process all)
+  -v, --verify          Verify that token files match the text files in output_dir
+```
+
+e.g. The command below to combine books into 100M text files and save tokenized text data into npy files.
+
+```
+uv run src/mlxgpt/prepare_dataset.py -d gutenberg/data/raw/ -o gutenberg_processed -t --type int32 -m 100
+```
+
+Then pretrain a small GPT-2 model using:
+```
+uv run src/mlxgpt/train.py -i gutenberg_processed/*.npy -s small -t 1 -p -c -e 100
 ```
 
 ## Run GPT-2 model by loading the weights from OpenAI's checkpoint

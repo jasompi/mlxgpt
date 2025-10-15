@@ -332,7 +332,7 @@ def main() -> None:
     parser.add_argument("-g", "--generate", type=str, default=None,
                         help="Generate text with given start context")
     parser.add_argument("--print_sample_iter", type=int, default=10000,
-                        help="Generate and print sample text every N iterations (default: 1000)")
+                        help="Generate and print sample text every N iterations (default: 10000)")
     parser.add_argument("-c", "--compile", action="store_true",
                         help="Compile the training step for faster execution")
     parser.add_argument("-i", "--input", type=str, nargs='+', default=["the-verdict.txt"],
