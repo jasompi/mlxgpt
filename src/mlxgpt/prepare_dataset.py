@@ -8,6 +8,7 @@ Script that processes the Project Gutenberg files into fewer larger files.
 """
 
 import argparse
+import glob
 import numpy as np
 import os
 import re
@@ -22,16 +23,18 @@ def is_english(text: str, threshold: float = 0.9) -> bool:
     return ascii_chars / len(text) > threshold
 
 
-def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500, separator="<|endoftext|>",
-                  fallback_encoding: str = "latin1", tokenizer: Optional[tiktoken.Encoding] = None,
-                  dtype: str = "int32", max_files: Optional[int] = None):
+def process_files(file_paths: list[str], target_dir: str, combine: bool, max_size_mb: int = 100,
+                  separator="<|endoftext|>", fallback_encoding: str = "latin1",
+                  tokenizer: Optional[tiktoken.Encoding] = None, dtype: str = "int32",
+                  max_files: Optional[int] = None):
     """
-    Combine multiple text files into larger files, optionally tokenizing them.
+    Process multiple text files, optionally combining them into larger files or saving individually.
 
     Args:
-        file_paths: List of input file paths to combine
-        target_dir: Directory where combined files will be saved
-        max_size_mb: Maximum size in MB for each combined file
+        file_paths: List of input file paths to process
+        target_dir: Directory where processed files will be saved
+        combine: If True, combine files into larger chunks. If False, process individually (default: True)
+        max_size_mb: Maximum size in MB for each combined file (ignored if combine=False)
         separator: Token to separate documents (default: "<|endoftext|>")
         fallback_encoding: Encoding to use if UTF-8 fails (default: "latin1")
         tokenizer: Optional tokenizer for creating .npy token files
@@ -39,7 +42,7 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
         max_files: Maximum number of output files to create (default: None, process all)
 
     Returns:
-        Number of combined files created
+        Number of files created/processed
     """
     # Create output directory if it doesn't exist
     if not os.path.exists(target_dir):
@@ -77,11 +80,32 @@ def combine_files(file_paths: list[str], target_dir: str, max_size_mb: int = 500
 
         # Normalize whitespace: replace multiple blank lines with a single blank line
         content = re.sub(r'\n\s*\n', '\n\n', content)
+        # Replace single newlines with spaces, but only when preceded and followed by non-space characters
+        content = re.sub(r'(?<![ \t\n])\n(?![ \t\n])', ' ', content)
         estimated_size = len(content.encode("utf-8"))
 
         # Tokenize if tokenizer is provided
         if tokenizer is not None:
             token_ids = tokenizer.encode(content)
+
+        # If not combining, save each file individually
+        if not combine:
+            # Get the base filename
+            base_name = os.path.basename(file_path)
+            target_file_path = os.path.join(target_dir, base_name)
+
+            # Save processed file
+            with open(target_file_path, "w", encoding="utf-8") as target_file:
+                target_file.write(content)
+
+            # Save tokenized version if tokenizer is provided
+            if tokenizer is not None:
+                name_without_ext = os.path.splitext(base_name)[0]
+                target_token_file_path = os.path.join(target_dir, f"{name_without_ext}_tokens.npy")
+                np.save(target_token_file_path, np.array(token_ids, dtype=dtype))
+
+            file_counter += 1
+            continue
 
         # Check if adding this document exceeds the size limit
         if current_size + estimated_size > max_size_mb * 1024 * 1024:
@@ -184,9 +208,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Preprocess and combine text files for pretraining")
 
-    parser.add_argument("-d", "--data_dir", type=str, default="gutenberg/data/raw",
-                        help="Directory containing the downloaded raw training data")
-    parser.add_argument("-m", "--max_size_mb", type=int, default=500,
+    parser.add_argument("-i", "--input_data", type=str, nargs='+', default=["gutenberg/data/raw"],
+                        help="Input data: directory path, wildcard pattern (e.g., data/*.txt), single file, or multiple files")
+    parser.add_argument("-m", "--max_size_mb", type=int, default=100,
                         help="The maximum file size for each concatenated file in megabytes")
     parser.add_argument("-o", "--output_dir", type=str, default="gutenberg_preprocessed",
                         help="Directory where the preprocessed data will be saved")
@@ -198,6 +222,8 @@ if __name__ == "__main__":
                         help="Maximum number of output dataset files to create (default: None, process all)")
     parser.add_argument("-v", "--verify", action="store_true",
                         help="Verify that token files match the text files in output_dir")
+    parser.add_argument("-c", "--combine", action="store_true", default=None,
+                        help="Combine input files into larger files. If not specified, inferred from input type (False for file lists, True for directories/wildcards)")
 
     args = parser.parse_args()
 
@@ -208,17 +234,52 @@ if __name__ == "__main__":
         else:
             print("\n❌ Verification failed for some files")
     else:
-        all_files = [os.path.join(path, name)
-                     for path, subdirs, files in os.walk(args.data_dir)
-                     for name in files if name.endswith((".txt", ".txt.utf8"))]
+        # Handle different input types: directory, wildcard pattern, single file, or multiple inputs
+        input_paths = args.input_data
+        all_files = []
+
+        # Track if all inputs are direct files (for inferring combine mode)
+        all_inputs_are_files = True
+
+        for input_path in input_paths:
+            if os.path.isfile(input_path):
+                # Single file
+                all_files.append(input_path)
+            elif os.path.isdir(input_path):
+                # Directory - walk through it
+                all_inputs_are_files = False
+                dir_files = [os.path.join(path, name)
+                             for path, subdirs, files in os.walk(input_path)
+                             for name in files if name.endswith((".txt", ".txt.utf8"))]
+                all_files.extend(dir_files)
+            else:
+                # Wildcard pattern or non-existent path
+                all_inputs_are_files = False
+                matched_files = glob.glob(input_path, recursive=True)
+                # Filter for text files if wildcard doesn't specify extension
+                if not any(input_path.endswith(ext) for ext in [".txt", ".txt.utf8"]):
+                    matched_files = [f for f in matched_files if f.endswith((".txt", ".txt.utf8"))]
+                all_files.extend(matched_files)
+
+        if not all_files:
+            print(f"Error: No files found matching input patterns: {input_paths}")
+            exit(1)
+
+        # Infer combine mode if not explicitly set
+        if args.combine is None:
+            combine_mode = not all_inputs_are_files  # False for file lists, True for dirs/wildcards
+        else:
+            combine_mode = args.combine
 
         tokenizer = tiktoken.get_encoding("gpt2") if args.tokenize else None
 
         print(f"Processing {len(all_files)} file(s)...")
+        print(f"Mode: {'Combining files' if combine_mode else 'Processing individually'}")
         if args.tokenize:
             print(f"Token dtype: {args.dtype}")
         if args.num_of_dataset:
             print(f"Maximum output files: {args.num_of_dataset}")
-        file_counter = combine_files(all_files, args.output_dir, max_size_mb=args.max_size_mb,
-                                     tokenizer=tokenizer, dtype=args.dtype, max_files=args.num_of_dataset)
+        file_counter = process_files(all_files, args.output_dir, combine=combine_mode,
+                                     max_size_mb=args.max_size_mb, tokenizer=tokenizer,
+                                     dtype=args.dtype, max_files=args.num_of_dataset)
         print(f"{file_counter} file(s) saved in {os.path.abspath(args.output_dir)}")

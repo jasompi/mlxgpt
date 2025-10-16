@@ -100,7 +100,7 @@ def truncate_text(text: str, max_length: Optional[int] = None) -> str:
         Truncated text with "..." suffix if truncated
     """
     # Replace newlines with spaces
-    output_text = text.strip().replace("\n", " ")
+    output_text = text.strip().replace("\n", "¬")
 
     # Truncate to max_length if specified
     if max_length is not None and len(output_text) > max_length:

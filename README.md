@@ -53,14 +53,14 @@ You can using the free books provided by Project Gutenberg as text corpus. To do
 
 ```bash
 $ uv run src/mlxgpt/prepare_dataset.py -h
-usage: prepare_dataset.py [-h] [-d DATA_DIR] [-m MAX_SIZE_MB] [-o OUTPUT_DIR] [-t] [--type DTYPE] [-n NUM_OF_DATASET] [-v]
+usage: prepare_dataset.py [-h] [-i INPUT_DATA [INPUT_DATA ...]] [-m MAX_SIZE_MB] [-o OUTPUT_DIR] [-t] [--type DTYPE] [-n NUM_OF_DATASET] [-v] [-c]
 
 Preprocess and combine text files for pretraining
 
 options:
   -h, --help            show this help message and exit
-  -d DATA_DIR, --data_dir DATA_DIR
-                        Directory containing the downloaded raw training data
+  -i INPUT_DATA [INPUT_DATA ...], --input_data INPUT_DATA [INPUT_DATA ...]
+                        Input data: directory path, wildcard pattern (e.g., data/*.txt), single file, or multiple files
   -m MAX_SIZE_MB, --max_size_mb MAX_SIZE_MB
                         The maximum file size for each concatenated file in megabytes
   -o OUTPUT_DIR, --output_dir OUTPUT_DIR
@@ -70,12 +70,13 @@ options:
   -n NUM_OF_DATASET, --num_of_dataset NUM_OF_DATASET
                         Maximum number of output dataset files to create (default: None, process all)
   -v, --verify          Verify that token files match the text files in output_dir
+  -c, --combine         Combine input files into larger files. If not specified, inferred from input type (False for file lists, True for directories/wildcards)
 ```
 
 e.g. The command below to combine books into 100M text files and save tokenized text data into npy files.
 
 ```
-uv run src/mlxgpt/prepare_dataset.py -d gutenberg/data/raw/ -o gutenberg_processed -t --type int32 -m 100
+uv run src/mlxgpt/prepare_dataset.py -i gutenberg/data/raw/ -o gutenberg_processed -t -m 100
 ```
 
 Then pretrain a small GPT-2 model using:
